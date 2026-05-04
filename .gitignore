@@ -22,6 +22,9 @@ logs/
 archive/
 runs/
 
+# Legacy on-disk files (kept locally, not committed)
+_legacy/
+
 # Debug artifacts and screenshots
 scripts/debug_artifacts/
 scripts/failure_screenshots/
