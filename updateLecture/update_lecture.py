@@ -31,7 +31,7 @@ os.makedirs(ARCHIVE_DIR, exist_ok=True)
 # ── Credentials ───────────────────────────────────────────────────────────────
 LOGIN_URL = "https://experience-admin.masaischool.com/"
 EMAIL     = "ravi.kiran@masaischool.com"
-PASSWORD  = "AgentMarley@2"
+PASSWORD  = "mAs@!4321"
 
 MAX_ATTEMPTS = 2
 

@@ -4,7 +4,25 @@ Site: https://admissions-admin.masaischool.com/iit/cohort-management
 
 CSV columns (cohort_id required; all others optional — leave blank to skip):
   cohort_id, batch_id, hall_ticket_prefix, student_prefix,
-  foundation_starts, batch_start_date, lms_batch_id, lms_section_ids,
+  foundation_starts, batch_start_date,
+  lms_batch_id                       — Whenever this OR any section bucket below is filled in,
+                                        the script deliberately swaps to a disposable throwaway
+                                        batch (THROWAWAY_BATCH) and back to the target batch
+                                        first, to force every section bucket to a guaranteed-
+                                        empty state (reselecting Batch ID — even unchanged —
+                                        wipes all section buckets, and some buckets don't expose
+                                        a removable chip for pre-existing picks, so detecting and
+                                        clearing stale selections directly proved unreliable).
+                                        Fill in every section bucket you want kept in that same
+                                        row — anything left blank stays empty after the reset.
+  lms_section_ids                    — LMS Section IDs (Fallback), comma-separated
+  lms_section_ids_after_full_fee      — After Full Fee Section IDs, comma-separated
+  lms_section_ids_student             — Persona: Student sections, comma-separated
+  lms_section_ids_working_professional — Persona: Working Professional sections, comma-separated
+  lms_trial_access                   — LMS Trial Access Before Full Fee toggle (TRUE/FALSE)
+  lms_section_ids_after_secure_seat   — After Secure Seat sections (only applied when
+                                        lms_trial_access is/becomes TRUE — field is hidden
+                                        in the UI otherwise), comma-separated
   manager_id, enable_kit, disable_welcome_kit_tshirt
 
 Place input CSV in ./input/ and run:
@@ -59,7 +77,10 @@ ERROR   = "ERROR"
 
 RESULT_FIELDS = [
     "cohort_id", "batch_id", "hall_ticket_prefix", "student_prefix",
-    "foundation_starts", "batch_start_date", "lms_batch_id", "lms_section_ids",
+    "foundation_starts", "batch_start_date", "lms_batch_id",
+    "lms_section_ids", "lms_section_ids_after_full_fee",
+    "lms_section_ids_student", "lms_section_ids_working_professional",
+    "lms_trial_access", "lms_section_ids_after_secure_seat",
     "manager_id", "enable_kit", "disable_welcome_kit_tshirt", "notes",
 ]
 SUMMARY_FIELDS = RESULT_FIELDS[1:-1]
@@ -172,6 +193,71 @@ def _dismiss_dialog(page):
         pass
 
 
+_TOAST_SUCCESS_PAT = re.compile(
+    r"(LMS settings saved|Field updated successfully|Important date updated|all.*(changes|updates).*(done|saved|complete))",
+    re.I,
+)
+_TOAST_ERROR_PAT = re.compile(r"(error|failed|invalid|please select)", re.I)
+
+# The LMS Settings card has a PERMANENT static reminder banner containing the
+# word "required" — confirmed live that broadening the error pattern to include
+# "required" made every single save falsely match this static text as if it
+# were an error toast, even on a real success. Anything containing this phrase
+# is page furniture, never an actual notification, and must be excluded.
+_STATIC_NOTE_TEXT = "at least one Section ID, and Manager ID are all required"
+
+
+def _wait_for_toast(page, timeout_ms: int = 4000):
+    """Poll briefly for the top-right save-confirmation/error toast instead of
+    assuming a button click succeeded just because it didn't raise — confirmed
+    live that the UI can show an error toast (e.g. "Error updating field")
+    while a click still goes through cleanly with no exception.
+    Returns (True, text) on a recognized success toast, (False, text) on a
+    recognized error toast, or (None, "") if no toast appeared in time
+    (inconclusive — caller should not assume success)."""
+    elapsed = 0
+    step = 250
+    while elapsed <= timeout_ms:
+        # Prefer real ARIA notification roles — toasts are almost always built
+        # with role="status"/"alert" for accessibility, which the page's own
+        # static helper text would not carry, sidestepping the collision above
+        # entirely rather than relying only on excluding known static text.
+        role_toast = page.locator("[role='status'], [role='alert']")
+        for i in range(role_toast.count()):
+            try:
+                txt = role_toast.nth(i).inner_text().strip()
+            except Exception:
+                continue
+            if not txt or _STATIC_NOTE_TEXT in txt:
+                continue
+            if _TOAST_ERROR_PAT.search(txt):
+                return False, txt
+            if _TOAST_SUCCESS_PAT.search(txt):
+                return True, txt
+            return None, txt  # a real toast, just not one of our known phrasings
+
+        err = page.get_by_text(_TOAST_ERROR_PAT)
+        for i in range(err.count()):
+            try:
+                txt = err.nth(i).inner_text().strip()
+            except Exception:
+                continue
+            if _STATIC_NOTE_TEXT in txt:
+                continue
+            return False, txt
+
+        ok = page.get_by_text(_TOAST_SUCCESS_PAT)
+        if ok.count() > 0:
+            try:
+                return True, ok.first.inner_text().strip()
+            except Exception:
+                return True, "(success toast, text unreadable)"
+
+        page.wait_for_timeout(step)
+        elapsed += step
+    return None, ""
+
+
 # ── Tab navigation ─────────────────────────────────────────────────────────────
 def _go_to_tab(page, name: str):
     _dismiss_dialog(page)
@@ -232,13 +318,73 @@ def _update_labeled_field(page, label_text: str, desired, field_name: str) -> st
 
 
 def _update_batch_id(page, desired) -> str:
-    return _update_labeled_field(page, "Batch ID", desired, "Batch ID")
+    # Batch ID is auto-mapped from elsewhere (its edit pencil actually opens an
+    # "Edit lmsBatchId" dialog, not the batch code) — never write to it directly.
+    print("  Batch ID → SKIP (auto-mapped, not directly editable)")
+    return SKIPPED
 
 def _update_hall_ticket_prefix(page, desired) -> str:
     return _update_labeled_field(page, "Hall Ticket Prefix", desired, "Hall Ticket Prefix")
 
 def _update_student_prefix(page, desired) -> str:
     return _update_labeled_field(page, "Student Prefix", desired, "Student Prefix")
+
+
+# Batch Start Date moved from the Dates-tab table (now read-only there) to a
+# pencil-edit card on Basic Details, same layout as Batch ID — but its field
+# is a real datetime-local input, so it needs date parsing like _update_date_field.
+def _update_batch_start_date(page, desired_csv) -> str:
+    field_name = "Batch Start Date"
+    if is_empty(desired_csv):
+        print(f"  {field_name} → SKIP (blank in CSV)")
+        return SKIPPED
+
+    desired_dt = parse_dt(str(desired_csv).strip())
+    if not desired_dt:
+        print(f"  {field_name} → FAILED (cannot parse date '{desired_csv}')")
+        return FAILED
+
+    try:
+        section = page.locator("div.p-3").filter(
+            has=page.locator("span.text-gray-600", has_text=field_name)
+        )
+        section.wait_for(state="visible", timeout=6_000)
+        pencil = section.locator("button.text-blue-600")
+        pencil.wait_for(state="visible", timeout=6_000)
+        pencil.click()
+        page.wait_for_timeout(600)
+
+        dt_input = page.get_by_role("textbox").first
+        dt_input.wait_for(state="visible", timeout=6_000)
+        current = dt_input.input_value().strip()
+
+        if current == desired_dt:
+            print(f"  {field_name} → SKIP (already '{dt_display(current)}')")
+            try:
+                page.get_by_role("button", name="Cancel").click()
+            except Exception:
+                page.keyboard.press("Escape")
+            page.wait_for_timeout(400)
+            return SKIPPED
+
+        print(f"  {field_name} → UPDATE "
+              f"'{dt_display(current) if current else 'empty'}' → '{dt_display(desired_dt)}'")
+        dt_input.fill(desired_dt)
+        page.wait_for_timeout(200)
+        page.get_by_role("button", name="Save Changes").click()
+        page.wait_for_timeout(800)
+        return CHANGED
+
+    except Exception as e:
+        print(f"  {field_name} → FAILED: {e}")
+        try:
+            page.get_by_role("button", name="Cancel").click()
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+        return FAILED
 
 
 # ── Date fields ────────────────────────────────────────────────────────────────
@@ -290,184 +436,480 @@ def _update_date_field(page, row_label: str, desired_csv, field_name: str) -> st
 
 
 # ── LMS Settings ──────────────────────────────────────────────────────────────
-def _update_lms_settings(page, row) -> dict:
-    results = {"lms_batch_id": SKIPPED, "lms_section_ids": SKIPPED, "manager_id": SKIPPED}
+# The LMS Settings card now has five near-identical section pickers stacked on
+# the same page (Fallback, After Full Fee, Student, Working Professional, After
+# Secure Seat). A page-wide "all chips" / "all Add-sections buttons" selector
+# would touch the wrong bucket, so every bucket op is scoped to its own card via
+# _bucket_container() before touching chips or the add-sections button.
 
-    lms_batch    = str(row.get("lms_batch_id",   "")).strip() if not is_empty(row.get("lms_batch_id"))   else ""
-    sections_raw = str(row.get("lms_section_ids","")).strip() if not is_empty(row.get("lms_section_ids")) else ""
-    sections     = [s.strip() for s in sections_raw.split(",") if s.strip()]
-    manager_id   = str(row.get("manager_id",     "")).strip() if not is_empty(row.get("manager_id"))     else ""
+def _bucket_container(page, heading_text: str, add_button_name: str):
+    """Locate the specific section-bucket card by pairing its heading text with
+    its own 'Add sections...' button, so operations don't leak into a sibling
+    bucket that happens to share chip/button markup."""
+    return page.locator("div").filter(
+        has_text=re.compile(re.escape(heading_text))
+    ).filter(
+        has=page.get_by_role("button", name=add_button_name)
+    ).last
 
-    if not lms_batch and not sections and not manager_id:
-        print("  LMS Settings → SKIP (all blank in CSV)")
-        return results
 
-    if lms_batch:
-        print(f"  LMS Batch ID → '{lms_batch}'")
+def _update_section_bucket(page, heading_text: str, add_button_name: str,
+                            search_placeholder: str, desired_csv, field_name: str) -> str:
+    sections_raw = "" if is_empty(desired_csv) else str(desired_csv).strip()
+    sections = [s.strip() for s in sections_raw.split(",") if s.strip()]
+    if not sections:
+        print(f"  {field_name} → SKIP (blank in CSV)")
+        return SKIPPED
+
+    try:
+        container = _bucket_container(page, heading_text, add_button_name)
+        container.wait_for(state="visible", timeout=6_000)
+
+        def _chips():
+            # Chip remove icons are icon-only buttons with NO accessible text
+            # (confirmed via live recording) — not a literal "×" glyph.
+            return container.get_by_role("button", name=re.compile(r"^$"))
+
+        # Check what's actually there before touching anything — a prior batch-ID
+        # change may or may not have reset this bucket, so don't assume either way.
         try:
-            # Open dropdown — try the wrapper div first, fall back to any trigger button near "LMS Batch" text
-            try:
-                page.locator(".lms-batch-dropdown button").first.click()
-            except Exception:
-                page.locator("div, section").filter(
-                    has=page.locator("text=/LMS Batch/i")
-                ).get_by_role("button").first.click()
-            page.wait_for_timeout(800)
+            current_text = container.inner_text()
+        except Exception:
+            current_text = ""
+        current_count = _chips().count()
+        already_matches = (
+            current_count == len(sections)
+            and all(s.lower() in current_text.lower() for s in sections)
+        )
+        if already_matches:
+            print(f"  {field_name} → SKIP (already set to {sections})")
+            return SKIPPED
+        print(f"    Currently: {current_count} section(s) selected — desired: {sections}")
 
-            search = page.get_by_placeholder("Search batches...")
-            search.wait_for(state="visible", timeout=8_000)
-            search.fill(lms_batch)
+        def _open_dropdown():
+            container.get_by_role("button", name=add_button_name).first.click()
+            page.wait_for_timeout(1_000)
+
+        def _search_box():
+            box = page.get_by_placeholder(search_placeholder)
+            if box.count() == 0:
+                box = page.locator("input[placeholder*='Search sections']")
+            return box.first
+
+        def _selected_count() -> int:
+            done_btn = container.get_by_role("button").filter(
+                has_text=re.compile(r"Done \(\d+ selected\)", re.I)
+            )
+            if done_btn.count() == 0:
+                return -1  # sentinel: Done counter not found/visible
+            try:
+                txt = done_btn.first.inner_text()
+            except Exception:
+                return -1
+            m = re.search(r"Done \((\d+) selected\)", txt)
+            return int(m.group(1)) if m else -1
+
+        def _row_is_selected(row) -> bool:
+            for attr in ("aria-pressed", "aria-checked", "aria-selected"):
+                try:
+                    val = row.get_attribute(attr)
+                except Exception:
+                    val = None
+                if val is not None:
+                    return val.lower() == "true"
+            return False
+
+        # 1) Remove visible chip-pills (Fallback / After Full Fee / After Secure
+        #    Seat show these outside the dropdown).
+        removed = 0
+        for _ in range(50):
+            rm = _chips()
+            if rm.count() == 0:
+                break
+            rm.first.click()
+            page.wait_for_timeout(300)
+            removed += 1
+        if removed:
+            print(f"    Cleared {removed} existing chip(s)")
+        else:
+            print("    No existing chips to clear")
+
+        # 2) The Persona buckets (Student / Working Professional) don't render a
+        #    chip-pill at all — proven live: the dropdown's own "Done (N selected)"
+        #    counter showed 2 pre-existing selections even though 0 chips were
+        #    visible outside it. Clearing the pills above isn't enough there, so
+        #    open the picker, and un-toggle whatever it still reports as selected.
+        _open_dropdown()
+        search_box = _search_box()
+        if search_box.count() > 0:
+            try:
+                search_box.fill("")
+            except Exception:
+                pass
+            page.wait_for_timeout(600)
+
+        stale = _selected_count()
+        if stale > 0:
+            print(f"    Dropdown reports {stale} pre-existing selection(s) with no visible chip — clearing via toggle")
+            done_pat = re.compile(r"Done \(\d+ selected\)", re.I)
+            for _ in range(stale + 5):
+                if _selected_count() <= 0:
+                    break
+                rows = container.get_by_role("button")
+                unclicked_one = False
+                for i in range(rows.count()):
+                    row = rows.nth(i)
+                    try:
+                        txt = row.inner_text().strip()
+                    except Exception:
+                        continue
+                    if done_pat.search(txt) or txt == add_button_name.rstrip("."):
+                        continue
+                    if _row_is_selected(row):
+                        before_stale = _selected_count()
+                        row.click()
+                        page.wait_for_timeout(500)
+                        if _selected_count() < before_stale:
+                            unclicked_one = True
+                            break
+                if not unclicked_one:
+                    print("    [WARN] Could not identify remaining stale selection(s) via "
+                          "aria-pressed/checked/selected — they may persist alongside new picks")
+                    break
+            remaining = _selected_count()
+            if remaining > 0:
+                print(f"    [WARN] {remaining} stale selection(s) still present after clearing attempt")
+            else:
+                print("    Stale selection(s) cleared")
+
+        def _try_select(section: str) -> bool:
+            if _search_box().count() == 0:
+                _open_dropdown()
+            search = _search_box()
+            search.wait_for(state="visible", timeout=6_000)
+            before = _chips().count()
+            before_selected = _selected_count()
+            search.fill(section)
             page.wait_for_timeout(1_200)
 
-            candidate = page.get_by_role("button").filter(
-                has_text=re.compile(re.escape(lms_batch), re.I)
-            ).first
-            candidate.wait_for(state="visible", timeout=6_000)
-            candidate.click()
-            page.wait_for_timeout(800)
+            pattern  = re.compile(re.escape(section), re.I)
+            done_pat = re.compile(r"Done \(\d+ selected\)", re.I)
 
-            # Verify: search box should be gone (dropdown closed) or the selected label is visible
-            selected_visible = page.locator(
-                f"text={lms_batch}"
-            ).count() > 0
-            if selected_visible:
-                print(f"    ✓ batch '{lms_batch}' selected")
-                results["lms_batch_id"] = CHANGED
-            else:
-                print(f"    [WARN] batch selection could not be verified — marking FAILED")
-                results["lms_batch_id"] = FAILED
-
-        except Exception as e:
-            print(f"    [ERROR] LMS Batch ID: {e}")
-            results["lms_batch_id"] = FAILED
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-            page.wait_for_timeout(400)
-
-    if sections:
-        expected = len(sections)
-        print(f"  LMS Section IDs → {expected} section(s): {sections}")
-        try:
-            removed = 0
-            for _ in range(50):
-                rm = page.locator("span.bg-green-50 button")
-                if rm.count() == 0:
-                    break
-                rm.first.click()
-                page.wait_for_timeout(400)
-                removed += 1
-            if removed:
-                print(f"    Cleared {removed} existing section(s)")
-                page.wait_for_timeout(600)
-            else:
-                print("    No existing sections to clear")
-
-            def _section_dropdown_open() -> bool:
-                return page.get_by_placeholder("Search sections...").is_visible()
-
-            def _open_section_dropdown():
-                try:
-                    page.locator(".lms-section-dropdown button").first.click()
-                except Exception:
-                    page.locator("div, section").filter(
-                        has=page.locator("text=/LMS Section/i")
-                    ).get_by_role("button").first.click()
-                page.wait_for_timeout(1_000)
-
-            def _chip_count() -> int:
-                return page.locator("span.bg-green-50").count()
-
-            def _try_select_section(section: str) -> bool:
-                if not _section_dropdown_open():
-                    _open_section_dropdown()
-                search = page.get_by_placeholder("Search sections...")
-                search.wait_for(state="visible", timeout=6_000)
-                before = _chip_count()
-                search.fill(section)
-                page.wait_for_timeout(1_500)
-
-                pattern  = re.compile(re.escape(section), re.I)
-                done_pat = re.compile(r"Done \(\d+ selected\)", re.I)
-
-                def _best_candidate(locator):
-                    for idx in range(locator.count()):
-                        btn = locator.nth(idx)
-                        try:
-                            txt = btn.inner_text().strip()
-                        except Exception:
-                            continue
-                        if done_pat.search(txt):
-                            continue
-                        if pattern.search(txt):
-                            return btn
-                    return None
-
-                scoped    = page.locator(".lms-section-dropdown").get_by_role("button").filter(has_text=pattern)
-                candidate = _best_candidate(scoped)
-                if candidate is None:
-                    candidate = _best_candidate(page.get_by_role("button").filter(has_text=pattern))
-                if candidate is None:
-                    print(f"      no result found for '{section}'")
-                    return False
-
-                candidate.click()
-                page.wait_for_timeout(1_500)
-
-                after = _chip_count()
-                if after <= before:
-                    print(f"      click registered but chip count unchanged ({before} → {after}) — retrying")
-                    return False
-
-                if _section_dropdown_open():
-                    page.get_by_placeholder("Search sections...").fill("")
-                    page.wait_for_timeout(800)
-                return True
-
-            _open_section_dropdown()
-            ok_sections, fail_sections = [], []
-
-            for i, section in enumerate(sections):
-                print(f"    [{i+1}/{expected}] '{section}'")
-                succeeded = False
-                for attempt in range(1, 4):
+            def _best_candidate(locator):
+                for i in range(locator.count()):
+                    btn = locator.nth(i)
                     try:
-                        if _try_select_section(section):
-                            print(f"      ✓ selected (attempt {attempt})")
-                            ok_sections.append(section)
-                            succeeded = True
-                            break
-                        else:
-                            print(f"      attempt {attempt}: result not found, retrying…")
-                            page.wait_for_timeout(800)
-                    except Exception as ex:
-                        print(f"      attempt {attempt} error: {ex}")
-                        page.wait_for_timeout(800)
-                if not succeeded:
-                    print(f"      ✗ FAILED after 3 attempts")
-                    fail_sections.append(section)
+                        txt = btn.inner_text().strip()
+                    except Exception:
+                        continue
+                    if done_pat.search(txt):
+                        continue
+                    return btn, txt
+                return None, None
 
-            print(f"    Summary: {len(ok_sections)}/{expected} selected "
-                  f"— ok={ok_sections} fail={fail_sections}")
+            # Prefer a match scoped to this bucket's own card — with five
+            # near-identical pickers on one page, an unscoped page-wide search
+            # can click the wrong element and silently no-op (chip count won't
+            # move). Only fall back to page-wide if the results render outside
+            # this container (e.g. via a portal).
+            chosen, chosen_txt = _best_candidate(container.get_by_role("button").filter(has_text=pattern))
+            scope = "container"
+            if chosen is None:
+                chosen, chosen_txt = _best_candidate(page.get_by_role("button").filter(has_text=pattern))
+                scope = "page-wide"
 
-            done_btn = page.get_by_role("button").filter(has_text=re.compile(r"Done \(\d+ selected\)"))
-            if done_btn.count() > 0:
-                done_btn.first.click()
-                page.wait_for_timeout(800)
-            else:
-                print("    [WARN] 'Done' button not found — changes may not be saved")
+            if chosen is None:
+                print(f"      no result found for '{section}'")
+                return False
 
-            results["lms_section_ids"] = CHANGED if ok_sections else FAILED
+            print(f"      clicking ({scope}): '{chosen_txt}'")
+            chosen.click()
+            page.wait_for_timeout(1_200)
 
-        except Exception as e:
-            print(f"    [ERROR] LMS Section IDs: {e}")
-            results["lms_section_ids"] = FAILED
+            # Re-check the Done-counter AFTER the click regardless of whether it
+            # existed BEFORE — a bucket starting from 0 selections may not render
+            # "Done (N selected)" until the first pick lands, so checking only
+            # the pre-click state permanently fell back to the chip-count method
+            # even for buckets (Student/Working Professional) that never show a
+            # chip-pill at all, causing false failures on every attempt.
+            after_selected = _selected_count()
+            if after_selected >= 0:
+                baseline = before_selected if before_selected >= 0 else 0
+                if after_selected > baseline:
+                    return True
+                print(f"      click registered but selected-count unchanged "
+                      f"({baseline} → {after_selected}) — retrying")
+                return False
+
+            after = _chips().count()
+            if after <= before:
+                print(f"      click registered but chip count unchanged ({before} → {after}) — retrying")
+                return False
+            return True
+
+        if _search_box().count() == 0:
+            _open_dropdown()
+        ok, fail = [], []
+        for i, section in enumerate(sections):
+            print(f"    [{i+1}/{len(sections)}] '{section}'")
+            succeeded = False
+            for attempt in range(1, 4):
+                try:
+                    if _try_select(section):
+                        print(f"      ✓ selected (attempt {attempt})")
+                        ok.append(section)
+                        succeeded = True
+                        break
+                    print(f"      attempt {attempt}: result not found, retrying…")
+                    page.wait_for_timeout(800)
+                except Exception as ex:
+                    print(f"      attempt {attempt} error: {ex}")
+                    page.wait_for_timeout(800)
+            if not succeeded:
+                print(f"      ✗ FAILED after 3 attempts")
+                fail.append(section)
+
+        print(f"    Summary: {len(ok)}/{len(sections)} selected — ok={ok} fail={fail}")
+
+        done_btn = page.get_by_role("button").filter(has_text=re.compile(r"Done \(\d+ selected\)"))
+        if done_btn.count() > 0:
+            done_btn.first.click()
+            page.wait_for_timeout(800)
+        else:
+            print("    [WARN] 'Done' button not found — changes may not be saved")
+
+        return CHANGED if ok else FAILED
+
+    except Exception as e:
+        print(f"  {field_name} → FAILED: {e}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return FAILED
+
+
+def _update_trial_access_toggle(page, desired) -> str:
+    """LMS Trial Access Before Full Fee — unlike the Kit Settings toggles, this
+    does NOT auto-save on click; it only takes effect when 'Save LMS Settings'
+    is clicked afterward, so the caller must ensure that save fires even if
+    this is the only field that changed."""
+    field_name = "LMS Trial Access Before Full Fee"
+    desired_bool = to_bool(desired)
+    if desired_bool is None:
+        print(f"  {field_name} → SKIP (blank in CSV)")
+        return SKIPPED
+    try:
+        row = page.locator("div").filter(
+            has_text=re.compile(re.escape(field_name))
+        ).filter(
+            has=page.locator("input[type='checkbox']")
+        ).last
+        row.wait_for(state="visible", timeout=6_000)
+        checkbox = row.locator("input[type='checkbox']")
+        current  = checkbox.is_checked()
+        if current == desired_bool:
+            print(f"  {field_name} → SKIP (already {'ON' if desired_bool else 'OFF'})")
+            return SKIPPED
+        print(f"  {field_name} → UPDATE → {'ON' if desired_bool else 'OFF'} (takes effect on Save LMS Settings)")
+        row.locator("[data-part='control']").click()
+        page.wait_for_timeout(400)
+        if checkbox.is_checked() != desired_bool:
+            print(f"    [WARN] Toggle verify failed")
+            return FAILED
+        return CHANGED
+    except Exception as e:
+        print(f"  {field_name} → FAILED: {e}")
+        return FAILED
+
+
+# A batch that isn't used by any real cohort — selecting it, then selecting the
+# real target batch, is a deliberate two-step reset: reselecting Batch ID (even
+# to the same value) wipes every section bucket, and unlike trying to detect
+# and un-toggle stale hidden selections per bucket (unreliable — some buckets
+# don't expose a chip-pill for existing picks at all), forcing the wipe via a
+# disposable batch swap guarantees every bucket starts genuinely empty.
+THROWAWAY_BATCH = "IITMD-DM-EN-I-2608"
+
+
+def _batch_trigger(page):
+    # .last narrows to the innermost matching div/section (consistent with
+    # _bucket_container's pattern) — without it, EVERY ancestor div up to the
+    # page body also contains "LMS Batch" text somewhere in its subtree, so
+    # .first picked the outermost/broadest match and grabbed an unrelated
+    # button (confirmed live: it returned a "Counselling" button instead).
+    return page.locator("div, section").filter(
+        has=page.locator("text=/LMS Batch/i")
+    ).last.get_by_role("button").first
+
+
+def _select_batch(page, batch_value: str) -> bool:
+    """Search+select a batch in the LMS Batch ID dropdown. Returns True if the
+    selection appears to have taken.
+
+    Verifies via the numeric #<id> rather than the searched name/text: the
+    closed-state trigger only ever renders a generic "#<id> Batch #<id>" label
+    (confirmed live), never the friendly name, so checking for the searched
+    text on the page afterward is unreliable and previously false-negatived a
+    click that actually worked, aborting the whole reset dance early."""
+    try:
+        try:
+            page.locator(".lms-batch-dropdown button").first.click()
+        except Exception:
+            _batch_trigger(page).click()
+        page.wait_for_timeout(800)
+
+        search = page.get_by_placeholder("Search batches...")
+        search.wait_for(state="visible", timeout=8_000)
+        search.fill(batch_value)
+        page.wait_for_timeout(1_200)
+
+        candidate = page.get_by_role("button").filter(
+            has_text=re.compile(re.escape(batch_value), re.I)
+        ).first
+        candidate.wait_for(state="visible", timeout=6_000)
+        try:
+            expected_id_match = re.search(r"#(\d+)", candidate.inner_text())
+        except Exception:
+            expected_id_match = None
+        expected_id = expected_id_match.group(1) if expected_id_match else None
+
+        candidate.click()
+        page.wait_for_timeout(800)
+
+        if expected_id:
             try:
-                page.keyboard.press("Escape")
+                trigger_text = _batch_trigger(page).inner_text()
+            except Exception:
+                trigger_text = ""
+            m = re.search(r"#(\d+)", trigger_text)
+            if m and m.group(1) == expected_id:
+                return True
+            print(f"    [WARN] batch verify: expected #{expected_id}, trigger shows '{trigger_text.strip()}'")
+            return False
+
+        # Couldn't extract an ID from the candidate — fall back to text presence.
+        return page.locator(f"text={batch_value}").count() > 0
+    except Exception as e:
+        print(f"    [ERROR] batch select '{batch_value}': {e}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
+def _update_lms_settings(page, row) -> dict:
+    results = {
+        "lms_batch_id": SKIPPED,
+        "lms_section_ids": SKIPPED,
+        "lms_section_ids_after_full_fee": SKIPPED,
+        "lms_section_ids_student": SKIPPED,
+        "lms_section_ids_working_professional": SKIPPED,
+        "lms_trial_access": SKIPPED,
+        "lms_section_ids_after_secure_seat": SKIPPED,
+        "manager_id": SKIPPED,
+    }
+
+    lms_batch  = str(row.get("lms_batch_id", "")).strip() if not is_empty(row.get("lms_batch_id")) else ""
+    manager_id = str(row.get("manager_id", "")).strip() if not is_empty(row.get("manager_id")) else ""
+
+    section_bucket_cols = (
+        "lms_section_ids", "lms_section_ids_after_full_fee",
+        "lms_section_ids_student", "lms_section_ids_working_professional",
+        "lms_trial_access", "lms_section_ids_after_secure_seat",
+    )
+    needs_section_work = any(not is_empty(row.get(c)) for c in section_bucket_cols)
+
+    # The site itself requires Batch ID, at least one Fallback Section ID, and
+    # Manager ID for LMS settings to save at all. The reset dance below wipes
+    # the Fallback bucket to empty regardless of what's requested — if this row
+    # doesn't also supply lms_section_ids, Save will very likely fail required-
+    # field validation.
+    fallback_blank = is_empty(row.get("lms_section_ids"))
+    if (lms_batch or needs_section_work) and fallback_blank:
+        print("  [WARN] lms_section_ids (Fallback) is blank in this row, but it's a "
+              "REQUIRED field and the reset dance below will wipe it to empty — "
+              "Save LMS Settings will likely fail validation unless it's filled in.")
+
+    if lms_batch or needs_section_work:
+        target_batch = lms_batch
+        if not target_batch:
+            # No batch change requested, but sections still need a guaranteed-clean
+            # slate — figure out the current batch so we can reselect it after
+            # the throwaway reset (the closed trigger only shows the numeric ID,
+            # e.g. "#124 Batch #124", never a friendly name).
+            try:
+                m = re.search(r"#(\d+)", _batch_trigger(page).inner_text())
+                if m:
+                    target_batch = m.group(1)
             except Exception:
                 pass
-            page.wait_for_timeout(400)
+
+        if not target_batch:
+            print("  LMS Batch ID → [WARN] could not determine current batch to "
+                  "restore after reset — skipping section reset dance")
+        else:
+            # Do both selections back-to-back unconditionally — verification of
+            # the intermediate throwaway step is informational only, never a
+            # gate. A prior version aborted here whenever verification looked
+            # shaky, leaving the cohort stuck on the throwaway batch without
+            # ever attempting the real target — exactly the bug being fixed.
+            print(f"  Resetting section config via throwaway batch swap "
+                  f"('{THROWAWAY_BATCH}' → '{target_batch}')")
+            throwaway_ok = _select_batch(page, THROWAWAY_BATCH)
+            print(f"    throwaway batch selected: {throwaway_ok}")
+            page.wait_for_timeout(500)
+            target_ok = _select_batch(page, target_batch)
+            if target_ok:
+                print(f"    ✓ batch set to '{target_batch}' — sections reset to empty")
+            else:
+                print(f"    [WARN] could not confirm batch is now '{target_batch}' "
+                      f"— proceeding anyway; section searches below will reveal if wrong")
+            if lms_batch:
+                results["lms_batch_id"] = CHANGED if target_ok else FAILED
+
+    print("  LMS Section IDs (Fallback)")
+    results["lms_section_ids"] = _update_section_bucket(
+        page, "LMS Section IDs (Fallback)", "Add sections...", "Search sections...",
+        row.get("lms_section_ids"), "LMS Section IDs (Fallback)"
+    )
+
+    print("  After Full Fee Section IDs")
+    results["lms_section_ids_after_full_fee"] = _update_section_bucket(
+        page, "After Full Fee Section IDs", "Add sections for After Full Fee...",
+        "Search sections for After Full Fee...",
+        row.get("lms_section_ids_after_full_fee"), "After Full Fee Section IDs"
+    )
+
+    print("  Persona: Student Section IDs")
+    results["lms_section_ids_student"] = _update_section_bucket(
+        page, "Student", "Add sections for Student...", "Search sections for Student...",
+        row.get("lms_section_ids_student"), "Student Section IDs"
+    )
+
+    print("  Persona: Working Professional Section IDs")
+    results["lms_section_ids_working_professional"] = _update_section_bucket(
+        page, "Working Professional", "Add sections for Working Professional...",
+        "Search sections for Working Professional...",
+        row.get("lms_section_ids_working_professional"), "Working Professional Section IDs"
+    )
+
+    print("  LMS Trial Access Before Full Fee")
+    results["lms_trial_access"] = _update_trial_access_toggle(page, row.get("lms_trial_access"))
+
+    trial_desired = to_bool(row.get("lms_trial_access"))
+    after_secure_seat_csv = row.get("lms_section_ids_after_secure_seat")
+    if not is_empty(after_secure_seat_csv) and trial_desired is False:
+        print("  After Secure Seat Section IDs → SKIP (lms_trial_access is FALSE — field is hidden)")
+        results["lms_section_ids_after_secure_seat"] = SKIPPED
+    else:
+        print("  After Secure Seat Section IDs")
+        results["lms_section_ids_after_secure_seat"] = _update_section_bucket(
+            page, "After Secure Seat Section IDs", "Add sections for After Secure Seat...",
+            "Search sections for After Secure Seat...",
+            after_secure_seat_csv, "After Secure Seat Section IDs"
+        )
 
     if manager_id:
         print(f"  Manager ID → '{manager_id}'")
@@ -487,20 +929,63 @@ def _update_lms_settings(page, row) -> dict:
             results["manager_id"] = FAILED
 
     # Save — only if the UI actually registered a change (save button appears)
-    lms_attempted = any(results[k] == CHANGED for k in ("lms_batch_id", "lms_section_ids", "manager_id"))
+    lms_attempted = any(results[k] == CHANGED for k in (
+        "lms_batch_id", "lms_section_ids", "lms_section_ids_after_full_fee",
+        "lms_section_ids_student", "lms_section_ids_working_professional",
+        "lms_trial_access", "lms_section_ids_after_secure_seat", "manager_id",
+    ))
     if lms_attempted:
         save_btn = page.locator("button").filter(has_text=re.compile(r"Save LMS", re.I))
+        lms_fields = (
+            "lms_batch_id", "lms_section_ids", "lms_section_ids_after_full_fee",
+            "lms_section_ids_student", "lms_section_ids_working_professional",
+            "lms_trial_access", "lms_section_ids_after_secure_seat", "manager_id",
+        )
         try:
-            save_btn.wait_for(state="visible", timeout=3_000)
+            # Let the page settle after the last bucket's "Done" click before
+            # looking for Save — confirmed live that 3s wasn't always enough,
+            # causing Save to never get clicked at all (no toast, no 5s pause,
+            # and the real changes silently mislabeled as SKIPPED below).
+            page.wait_for_timeout(1_000)
+            save_btn.wait_for(state="visible", timeout=8_000)
             save_btn.first.click()
-            page.wait_for_timeout(1_500)
-            print("  [LMS SAVED]")
-        except Exception:
-            # Save button not visible — UI detected no actual change; treat as SKIPPED
-            print("  [LMS] Save button not present — values already match on page, treating as SKIPPED")
-            for k in ("lms_batch_id", "lms_section_ids", "manager_id"):
+            toast_ok, toast_text = _wait_for_toast(page)
+            if toast_ok is False:
+                print(f"  [LMS SAVE FAILED] notification: '{toast_text}'")
+                for k in lms_fields:
+                    if results[k] == CHANGED:
+                        results[k] = FAILED
+                results["notes"] = (results.get("notes", "") + f" | LMS save error toast: {toast_text}").strip(" |")
+            elif toast_ok is True:
+                print(f"  [LMS SAVED] notification: '{toast_text}'")
+            elif fallback_blank:
+                print("  [LMS SAVE UNCERTAIN] no confirmation toast observed, and "
+                      "lms_section_ids (Fallback, required) was left blank by this "
+                      "row's reset — treating as FAILED rather than assuming success.")
+                for k in lms_fields:
+                    if results[k] == CHANGED:
+                        results[k] = FAILED
+                results["notes"] = (results.get("notes", "") +
+                                     " | LMS save uncertain: required Fallback section left blank, no confirming toast").strip(" |")
+            else:
+                print("  [LMS SAVED] (no confirmation toast observed within timeout — treating click as success)")
+
+            # Deliberate pause so the on-screen notification (top-right) stays
+            # visible long enough to read/confirm before moving on to the next
+            # step or cohort, or closing the browser.
+            page.wait_for_timeout(5_000)
+        except Exception as e:
+            # We only get here when lms_attempted is True, i.e. something in
+            # this bucket run was genuinely marked CHANGED — so a missing Save
+            # button means the change never got persisted, not that nothing
+            # needed saving. Treating it as SKIPPED (the old assumption) would
+            # silently misreport a real failure as if everything were fine.
+            print(f"  [LMS SAVE FAILED] Save button never appeared/clickable: {e}")
+            for k in lms_fields:
                 if results[k] == CHANGED:
-                    results[k] = SKIPPED
+                    results[k] = FAILED
+            results["notes"] = (results.get("notes", "") +
+                                 " | LMS save failed: Save LMS Settings button not found/clickable").strip(" |")
 
     return results
 
@@ -548,7 +1033,8 @@ def process_cohort(page, row, base_url: str = BASE_URL) -> dict:
 
     print("  [Basic Details]")
     _go_to_tab(page, "Basic Details")
-    s["batch_id"] = _update_batch_id(page, row.get("batch_id"))
+    s["batch_id"]         = _update_batch_id(page, row.get("batch_id"))
+    s["batch_start_date"] = _update_batch_start_date(page, row.get("batch_start_date"))
 
     print("  [Identifiers]")
     _go_to_tab(page, "Identifiers")
@@ -559,9 +1045,6 @@ def process_cohort(page, row, base_url: str = BASE_URL) -> dict:
     _go_to_tab(page, "Dates")
     s["foundation_starts"] = _update_date_field(
         page, "Foundation Starts", row.get("foundation_starts"), "Foundation Starts"
-    )
-    s["batch_start_date"] = _update_date_field(
-        page, "Batch Start Date", row.get("batch_start_date"), "Batch Start Date"
     )
 
     print("  [Course Onboarding]")

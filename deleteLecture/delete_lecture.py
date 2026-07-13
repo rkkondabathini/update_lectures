@@ -32,7 +32,7 @@ for d in (INPUT_DIR, LOGS_DIR, ARCHIVE_DIR):
 LOGIN_URL    = "https://experience-admin.masaischool.com/"
 LECTURE_TMPL = "https://experience-admin.masaischool.com/lectures/detail/?id={lecture_id}"
 EMAIL        = "ravi.kiran@masaischool.com"
-PASSWORD     = "AgentMarley@2"
+PASSWORD     = "mAs@!4321"
 
 # ── Status ────────────────────────────────────────────────────────────────────
 SKIPPED = "SKIPPED"
@@ -99,8 +99,8 @@ def delete_lecture(page, lecture_id: str) -> dict:
     url = LECTURE_TMPL.format(lecture_id=lecture_id)
     s = {"lecture_id": lecture_id, "delete": SKIPPED, "notes": ""}
 
-    page.goto(url)
-    page.wait_for_load_state("networkidle")
+    page.goto(url, timeout=60_000)
+    page.wait_for_load_state("networkidle", timeout=30_000)
     page.wait_for_timeout(1_500)
 
     # Step 1 — click the trash icon (the only red-bordered button in the action row).
@@ -261,29 +261,33 @@ def run():
 
     all_results = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=200)
-        context = browser.new_context()
-        page    = context.new_page()
-
-        # Login
+    def _login(pg):
         print("Attempting auto-login...")
         try:
-            page.goto(LOGIN_URL)
-            page.wait_for_load_state("networkidle")
-            page.get_by_role("textbox", name="Your email").fill(EMAIL)
-            page.get_by_role("textbox", name="Your email").press("Tab")
-            page.get_by_role("textbox", name="Your password").fill(PASSWORD)
-            page.locator("svg").click()
-            page.get_by_role("button", name="Sign In").click()
-            page.wait_for_load_state("networkidle", timeout=20_000)
-            if "login" in page.url.lower() or page.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-                raise Exception(f"Still on login page: {page.url}")
+            pg.goto(LOGIN_URL)
+            pg.wait_for_load_state("networkidle")
+            pg.get_by_role("textbox", name="Your email").fill(EMAIL)
+            pg.get_by_role("textbox", name="Your email").press("Tab")
+            pg.get_by_role("textbox", name="Your password").fill(PASSWORD)
+            pg.locator("svg").click()
+            pg.get_by_role("button", name="Sign In").click()
+            pg.wait_for_load_state("networkidle", timeout=20_000)
+            if "login" in pg.url.lower() or pg.url.rstrip("/") == LOGIN_URL.rstrip("/"):
+                raise Exception(f"Still on login page: {pg.url}")
             print("Logged in.\n")
         except Exception as login_err:
             print(f"[WARN] Auto-login failed: {login_err}")
             input("Please log in manually, then press ENTER... ")
             print("Resuming...\n")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False, slow_mo=200)
+        context = browser.new_context()
+        page    = context.new_page()
+        _login(page)
+
+        consecutive_errors = 0
+        MAX_CONSECUTIVE    = 5
 
         for i, row in df.iterrows():
             lecture_id = str(row.get("lecture_id", "")).strip()
@@ -291,13 +295,43 @@ def run():
             print(f"[{i+1}/{n}] id={lecture_id}")
             try:
                 result = delete_lecture(page, lecture_id)
+                if result["delete"] in (DELETED, SKIPPED):
+                    consecutive_errors = 0
+                else:
+                    consecutive_errors += 1
             except Exception as e:
-                print(f"  [ERROR] {e}")
-                result = {"lecture_id": lecture_id, "delete": ERROR, "notes": str(e)}
+                err_msg = str(e)
+                print(f"  [ERROR] {err_msg}")
+                result = {"lecture_id": lecture_id, "delete": ERROR, "notes": err_msg}
+                consecutive_errors += 1
+
+                # Browser/page crashed — re-launch
+                if "has been closed" in err_msg or "Target closed" in err_msg:
+                    print("  [RECOVERY] Browser crashed — re-launching...")
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser = p.chromium.launch(headless=False, slow_mo=200)
+                    context = browser.new_context()
+                    page    = context.new_page()
+                    _login(page)
+                    consecutive_errors = 0
+
             all_results.append(result)
             print()
 
-        browser.close()
+            if consecutive_errors >= MAX_CONSECUTIVE:
+                print(f"\n[ABORT] {MAX_CONSECUTIVE} consecutive failures — stopping to avoid wasting time.")
+                for remaining_row in df.iloc[i+1:].itertuples():
+                    lid = str(getattr(remaining_row, "lecture_id", "")).strip()
+                    all_results.append({"lecture_id": lid, "delete": SKIPPED, "notes": "skipped after consecutive failures"})
+                break
+
+        try:
+            browser.close()
+        except Exception:
+            pass
 
     csv_path = os.path.join(LOGS_DIR, f"{log_stem}.csv")
     pd.DataFrame(all_results).to_csv(csv_path, index=False)

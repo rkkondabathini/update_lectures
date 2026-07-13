@@ -20,6 +20,7 @@ Run:
 import re
 import os
 import sys
+import time
 import glob
 import shutil
 import pandas as pd
@@ -40,7 +41,7 @@ LOGIN_URL  = "https://experience-admin.masaischool.com/"
 CREATE_URL = "https://experience-admin.masaischool.com/lectures/create/"
 LIST_URL   = "https://experience-admin.masaischool.com/lectures/?page=0"
 EMAIL      = "ravi.kiran@masaischool.com"
-PASSWORD   = "AgentMarley@2"
+PASSWORD   = "mAs@!4321"
 
 # ── Status constants ──────────────────────────────────────────────────────────
 SKIPPED = "SKIPPED"
@@ -485,6 +486,102 @@ def _set_toggle(page, label_pattern: str, desired: bool, field_name: str) -> str
         return FAILED
 
 
+# ── Payout type — only required for SOME hosts ───────────────────────────────
+# When a host is selected and that host has Payout type required, a "Payout
+# type *" dropdown appears in the host card with the validation message
+# "Select a payout type to continue.". If we don't pick a value the Create
+# button stays disabled. This helper picks the first valid option whenever
+# the field is present; it's a no-op if the field doesn't appear.
+
+def _select_payout_type_if_required(page, prefer: str = "live session", wait_seconds: int = 8) -> str:
+    """If a 'Payout type *' field appears, pick the option matching `prefer`
+    (default 'live session'); falls back to the first available option. No-op
+    if the field isn't present.
+
+    DOM shape (confirmed via Playwright codegen):
+      <label class="...">
+        Payout type *
+        ...
+        <div class="react-select">
+          <div class="react-select__control">
+            <div class="react-select__value-container">
+              <div class="react-select__input-container">…</div>
+
+    Strategy: find the <label> whose text starts with "Payout type" AND that
+    contains a .react-select__input-container, click that input container to
+    open the menu, then click the option matching `prefer` (or the first one).
+
+    Called twice in the per-lecture flow:
+      1. Just after the Primary Host is selected (catches in-card variant)
+      2. Just before clicking Create (catches the 'PAYOUT PLAN (EXTERNAL HOSTS)'
+         panel, which appears later for external hosts)
+    """
+    # Wait up to wait_seconds for the field to appear (it renders after host
+    # selection for some hosts, and may take a moment).
+    deadline = time.time() + wait_seconds
+    label = None
+    while time.time() < deadline:
+        try:
+            cand = (page.locator("label")
+                        .filter(has_text=re.compile(r"Payout type", re.I))
+                        .filter(has=page.locator(".react-select__input-container")))
+            n = cand.count()
+            for i in range(n):
+                el = cand.nth(i)
+                try:
+                    if el.is_visible(timeout=200):
+                        label = el
+                        break
+                except Exception:
+                    continue
+            if label is not None:
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(300)
+
+    if label is None:
+        return SKIPPED
+
+    try:
+        trigger = label.locator(".react-select__input-container").first
+        trigger.click()
+        page.wait_for_timeout(500)
+
+        # Pick preferred option, else fall back to first visible option
+        option = None
+        try:
+            cand = (page.locator(".react-select__option")
+                        .filter(has_text=re.compile(re.escape(prefer), re.I)))
+            if cand.count() > 0 and cand.first.is_visible(timeout=600):
+                option = cand.first
+        except Exception:
+            pass
+        if option is None:
+            try:
+                first = page.locator(".react-select__option").first
+                if first.count() > 0 and first.is_visible(timeout=600):
+                    option = first
+            except Exception:
+                pass
+
+        if option is None:
+            print(f"     [WARN] Payout type: dropdown opened but no options visible")
+            try: page.keyboard.press("Escape")
+            except Exception: pass
+            return FAILED
+
+        option.click()
+        page.wait_for_timeout(400)
+        print(f"     Payout type → '{prefer}'")
+        return CREATED
+    except Exception as e:
+        print(f"     [WARN] Payout type click failed: {e}")
+        try: page.keyboard.press("Escape")
+        except Exception: pass
+        return FAILED
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Per-lecture create
 # ═════════════════════════════════════════════════════════════════════════════
@@ -500,6 +597,7 @@ def create_lecture(page, row, hosts_map: dict) -> dict:
         "schedule":      SKIPPED,
         "concludes":     SKIPPED,
         "host":          SKIPPED,
+        "payout_type":   SKIPPED,
         "title_field":   SKIPPED,
         "zoom_link":     SKIPPED,
         "tags":          SKIPPED,
@@ -559,6 +657,10 @@ def create_lecture(page, row, hosts_map: dict) -> dict:
         print(f"  6. Primary Host  → '{host_name}' (match by email: {host_email})")
         s["host"] = _select_host_by_email(page, host_name, host_email)
 
+    # 6b. Payout type — only required for some hosts (no-op otherwise)
+    page.wait_for_timeout(500)  # let the host card finish rendering
+    s["payout_type"] = _select_payout_type_if_required(page)
+
     # 7. Batch
     batch = str(row.get("batch", "")).strip()
     print(f"  7. Batch         → '{batch}'")
@@ -605,6 +707,15 @@ def create_lecture(page, row, hosts_map: dict) -> dict:
     concludes_dt = combine_dt(row.get("concludes_date"), row.get("concludes_time"))
     print(f" 14. Concludes    → '{concludes_dt}'")
     s["concludes"] = _set_datetime(page, "Conclude", concludes_dt)
+
+    # 14b. Second-pass Payout type check — the "PAYOUT PLAN (EXTERNAL HOSTS)"
+    # panel may render only after later fields have caused re-renders.
+    # Picking 'live session' here is what enables Create when this panel is
+    # required for external hosts.
+    page.wait_for_timeout(500)
+    late_payout = _select_payout_type_if_required(page)
+    if late_payout == CREATED:
+        s["payout_type"] = CREATED
 
     # 15. Final verification — safety net in case anything still reset the dates
     if not is_blank(schedule_dt):
@@ -669,21 +780,38 @@ def run():
         print("Place input CSV (with 'title' column) and hosts CSV (with 'Name', 'Email') in input/")
         return
 
-    data_csv  = None
+    # Classify each CSV as data, hosts, or unknown
+    data_csvs = []
     hosts_csv = None
     for f in csv_files:
         kind = _classify_csv(f)
-        if kind == "data" and data_csv is None:
-            data_csv = f
+        if kind == "data":
+            data_csvs.append(f)
         elif kind == "hosts" and hosts_csv is None:
             hosts_csv = f
 
-    if not data_csv:
+    if not data_csvs:
         print(f"[ERROR] No data CSV found (needs 'title' and 'batch' columns)")
         return
     if not hosts_csv:
         print(f"[ERROR] No hosts CSV found (needs 'Name' and 'Email' columns)")
         return
+
+    # If multiple data CSVs found, prompt the user to pick (so parallel runs
+    # in different terminals can each select a different chunk).
+    if len(data_csvs) == 1:
+        data_csv = data_csvs[0]
+        print(f"Auto-selecting data CSV: {os.path.basename(data_csv)}")
+    else:
+        print(f"Found {len(data_csvs)} data CSV(s):")
+        for i, f in enumerate(data_csvs):
+            print(f"  [{i}] {os.path.basename(f)}")
+        idx = input("\nEnter file number: ").strip()
+        try:
+            data_csv = data_csvs[int(idx)]
+        except (ValueError, IndexError):
+            print("[ERROR] Invalid selection.")
+            return
 
     print(f"Data CSV  → {os.path.basename(data_csv)}")
     print(f"Hosts CSV → {os.path.basename(hosts_csv)}")
@@ -749,7 +877,7 @@ def run():
                 print(f"  [ERROR] {e}")
                 result = {k: ERROR for k in
                           ["title_field","batch","section","category","module","type",
-                           "schedule","concludes","host","zoom_link","tags",
+                           "schedule","concludes","host","payout_type","zoom_link","tags",
                            "mandatory","show_feedback","test_groups","save"]}
                 result["title"] = row.get("title", "")
                 result["notes"] = str(e)
@@ -769,7 +897,7 @@ def run():
     df_log = pd.DataFrame(all_results)
     print("\n══ Summary ══════════════════════════════════════════════")
     field_cols = ["title_field","batch","section","category","module","type",
-                  "schedule","concludes","host","zoom_link","tags",
+                  "schedule","concludes","host","payout_type","zoom_link","tags",
                   "mandatory","show_feedback","test_groups","save"]
     for col in field_cols:
         if col in df_log.columns:
@@ -778,7 +906,13 @@ def run():
     skip_keys = {"notes", "title"}
     failed = [s for s in all_results
               if any(v in (FAILED, ERROR) for k, v in s.items() if k not in skip_keys)]
-    print(f"\n  Lectures with failures/errors: {len(failed)}/{len(all_results)}")
+    not_created_idx = [i for i, s in enumerate(all_results) if s.get("save") != CREATED]
+    saved_with_warnings = len(failed) - len(not_created_idx)
+
+    print(f"\n  Total: {len(all_results)}  "
+          f"|  Created: {len(all_results) - len(not_created_idx)}  "
+          f"|  Not created: {len(not_created_idx)}  "
+          f"|  Created with field warnings: {max(saved_with_warnings, 0)}")
 
     if failed:
         print("\n  ── Failed / Error lectures ──────────────────────────")
@@ -791,6 +925,16 @@ def run():
                 line += f"  — {note}"
             print(line)
         print("  ─────────────────────────────────────────────────────")
+
+    # Auto-generate a retry CSV for any lectures that didn't get created.
+    # Dropped into input/ so a follow-up run can pick it up directly.
+    if not_created_idx:
+        retry_df   = df.iloc[not_created_idx].reset_index(drop=True)
+        retry_path = os.path.join(INPUT_DIR, f"retry_{base}_{timestamp}.csv")
+        retry_df.to_csv(retry_path, index=False)
+        print(f"\n  Retry CSV ({len(retry_df)} not-created lectures) → {retry_path}")
+        print(f"  To re-run just these, move the original CSV out of input/ "
+              f"and run the script again.")
 
     print("═════════════════════════════════════════════════════════")
     print("Done.")

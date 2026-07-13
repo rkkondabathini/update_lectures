@@ -6,12 +6,14 @@ Required CSV column:
   section_id        — numeric section ID (used in URL)
 
 Optional CSV columns (each blank cell is skipped on that row):
+  section_name          — text input "Enter section name" (required field, marked *)
   section_display_name  — text input "Enter section display name"
   type                  — dropdown "Type"
   course                — dropdown "Course"
   course_type           — dropdown "Course Type"
   flag                  — dropdown "Flag"
   module                — dropdown "Module" (label:nth-child(4))
+  enable_zoom_web_view  — dropdown "Enable Zoom Web View" (Yes / No)
 
 Other CSV columns (e.g. 'name') are ignored — kept for reference.
 
@@ -41,7 +43,7 @@ for d in (INPUT_DIR, LOGS_DIR, ARCHIVE_DIR):
 LOGIN_URL        = "https://experience-admin.masaischool.com/"
 SECTION_URL_TMPL = "https://experience-admin.masaischool.com/sections/?page=0&section_id={section_id}"
 EMAIL            = "ravi.kiran@masaischool.com"
-PASSWORD         = "AgentMarley@2"
+PASSWORD         = "mAs@!4321"
 
 # ── Status constants ──────────────────────────────────────────────────────────
 SKIPPED = "SKIPPED"
@@ -50,7 +52,10 @@ FAILED  = "FAILED"
 ERROR   = "ERROR"
 
 # Fields tracked in the result CSV (extend when adding more updaters)
-RESULT_FIELDS = ["section_display_name", "type", "course", "course_type", "flag", "module"]
+RESULT_FIELDS = [
+    "section_name", "section_display_name", "type", "course", "course_type", "flag", "module",
+    "enable_zoom_web_view",
+]
 
 
 # ── Tee logger ────────────────────────────────────────────────────────────────
@@ -239,6 +244,21 @@ def _update_modal_dropdown_by_label(page, label_text: str, desired: str, field_n
 
 # ── Specific field updaters ──────────────────────────────────────────────────
 
+def _update_modal_section_name(page, desired: str) -> str:
+    """Update the 'Enter section name' text input (required field, marked *)."""
+    if is_blank(desired):
+        return SKIPPED
+    try:
+        box = page.get_by_role("textbox", name="Enter section name")
+        box.click()
+        box.fill(str(desired))
+        page.wait_for_timeout(300)
+        return CHANGED
+    except Exception as e:
+        print(f"     [WARN] Section name update failed: {e}")
+        return FAILED
+
+
 def _update_modal_section_display_name(page, desired: str) -> str:
     """Update the 'Enter section display name' text input."""
     if is_blank(desired):
@@ -293,6 +313,12 @@ def _update_modal_flag(page, desired: str) -> str:
     return _update_modal_dropdown_by_label(page, "Flag", desired, "Flag")
 
 
+def _update_modal_enable_zoom_web_view(page, desired: str) -> str:
+    return _update_modal_dropdown_by_label(
+        page, "Enable Zoom Web View", desired, "Enable Zoom Web View"
+    )
+
+
 # ── Per-section processor ────────────────────────────────────────────────────
 def process_section(page, row) -> dict:
     section_id = str(row.get("section_id", "")).strip()
@@ -311,16 +337,22 @@ def process_section(page, row) -> dict:
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1_500)
 
-    # Click Edit on the row
-    edit_cell = page.get_by_role("cell", name="Edit")
-    if edit_cell.count() == 0:
-        print(f"  [WARN] No Edit cell — section_id '{section_id}' not found")
+    # Click Edit on the row. The Action column now also contains a 'Copy' link
+    # alongside 'Edit', so we target the exact "Edit" text/link rather than the
+    # cell. Try link role → text match → cell as progressive fallbacks.
+    edit_locator = page.get_by_role("link", name=re.compile(r"^Edit$", re.I))
+    if edit_locator.count() == 0:
+        edit_locator = page.get_by_text("Edit", exact=True)
+    if edit_locator.count() == 0:
+        edit_locator = page.get_by_role("cell", name="Edit")
+    if edit_locator.count() == 0:
+        print(f"  [WARN] No Edit element — section_id '{section_id}' not found")
         s["notes"]  = "Section not found"
         s["module"] = FAILED
         return s
 
     try:
-        edit_cell.first.click()
+        edit_locator.first.click()
         page.wait_for_timeout(1_000)
     except Exception as e:
         print(f"  [WARN] Failed to click Edit: {e}")
@@ -329,23 +361,31 @@ def process_section(page, row) -> dict:
         return s
 
     # Apply field updates — order: text fields first, then dropdowns
-    print(f"  1. Section display name → '{str(row.get('section_display_name','')).strip()}'")
+    print(f"  1. Section name → '{str(row.get('section_name','')).strip()}'")
+    s["section_name"] = _update_modal_section_name(page, row.get("section_name", ""))
+
+    print(f"  2. Section display name → '{str(row.get('section_display_name','')).strip()}'")
     s["section_display_name"] = _update_modal_section_display_name(page, row.get("section_display_name", ""))
 
-    print(f"  2. Type        → '{str(row.get('type','')).strip()}'")
+    print(f"  3. Type        → '{str(row.get('type','')).strip()}'")
     s["type"] = _update_modal_type(page, row.get("type", ""))
 
-    print(f"  3. Course      → '{str(row.get('course','')).strip()}'")
+    print(f"  4. Course      → '{str(row.get('course','')).strip()}'")
     s["course"] = _update_modal_course(page, row.get("course", ""))
 
-    print(f"  4. Course Type → '{str(row.get('course_type','')).strip()}'")
+    print(f"  5. Course Type → '{str(row.get('course_type','')).strip()}'")
     s["course_type"] = _update_modal_course_type(page, row.get("course_type", ""))
 
-    print(f"  5. Flag        → '{str(row.get('flag','')).strip()}'")
+    print(f"  6. Flag        → '{str(row.get('flag','')).strip()}'")
     s["flag"] = _update_modal_flag(page, row.get("flag", ""))
 
-    print(f"  6. Module      → '{str(row.get('module','')).strip()}'")
+    print(f"  7. Module      → '{str(row.get('module','')).strip()}'")
     s["module"] = _update_modal_module(page, row.get("module", ""))
+
+    print(f"  8. Enable Zoom Web View → '{str(row.get('enable_zoom_web_view','')).strip()}'")
+    s["enable_zoom_web_view"] = _update_modal_enable_zoom_web_view(
+        page, row.get("enable_zoom_web_view", "")
+    )
 
     # Save if anything was actually CHANGED
     if any(s[f] == CHANGED for f in RESULT_FIELDS):
@@ -406,9 +446,14 @@ def run():
     all_results = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=200)
-        context = browser.new_context()
+        browser = p.chromium.launch(
+            headless=False,
+            slow_mo=400,
+            args=["--start-maximized"],
+        )
+        context = browser.new_context(no_viewport=True)
         page    = context.new_page()
+        page.bring_to_front()
 
         # Login
         print("Attempting auto-login...")
